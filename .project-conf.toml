@@ -1,0 +1,11 @@
+system = "github"
+key    = "iansmith/slopstop-bench"
+prefix = "BENCH"
+
+[status_labels]
+in_progress = "status:in-progress"
+
+[autonomous]
+enabled     = true
+branch_type = "feat"
+metrics_emit_path = "/Users/iansmith/slopbench/results/pipeline-metrics"
