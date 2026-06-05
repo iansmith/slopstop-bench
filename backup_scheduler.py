@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 DEFAULT_MAX_PACK_BYTES = 1048576
 
 MOUNT_PREFIX = "mount://"
+BACKUP_PREFIX = "backup://"
 
 _WEEKDAYS = {
     "mon": 0,
@@ -185,6 +186,39 @@ def resolve_source_dir(source, mount):
     return mount if rel == "" else mount / rel
 
 
+def resolve_dest_dir(destination, backup_root, job_id):
+    """Resolve a job's backup directory: <backup_root>/<dest_rel>/<job_id>.
+
+    Mirrors resolve_source_dir for the 'backup://' scheme. Returns None when no
+    backup root was given (--backup omitted) or the job declares no destination,
+    in which case the caller treats the job as having no existing backups.
+    """
+    if backup_root is None or not destination:
+        return None
+    rel = (
+        destination[len(BACKUP_PREFIX):]
+        if destination.startswith(BACKUP_PREFIX)
+        else destination
+    )
+    rel = rel.strip("/")
+    base = backup_root if rel == "" else backup_root / rel
+    return base / job_id
+
+
+def load_dest_state(dest_dir):
+    """Map source-relative path -> content digest for existing backups, or {}.
+
+    Tolerates a missing directory. Reuses list_source_files so the relative-path
+    convention matches the source walk exactly.
+    """
+    state = {}
+    if dest_dir is None:
+        return state
+    for rel in list_source_files(dest_dir):
+        state[rel] = content_digest((dest_dir / rel).read_bytes())
+    return state
+
+
 def list_source_files(source_dir):
     """All files under source_dir, as source-relative POSIX paths, sorted."""
     if not source_dir.exists():
@@ -246,6 +280,7 @@ def run(args):
     window_end = now_local + timedelta(hours=args.duration)
     now_local_str = iso_with_offset(now_local)
     mount = Path(args.mount)
+    backup_root = Path(args.backup) if args.backup else None
 
     due = []
     for job in jobs:
@@ -283,6 +318,28 @@ def run(args):
         if isinstance(strategy, dict):
             strat_kind = strategy.get("kind")
             options = strategy.get("options") or {}
+
+        # Incremental backups (full strategy only): scan the destination for this
+        # job's existing backups before selecting files. Pack never tracks state
+        # (.tar archives aren't per-file), and a job without a destination keeps
+        # checkpoint_2 behavior. DEST_STATE_LOADED is emitted between JOB_STARTED
+        # and STRATEGY_SELECTED.
+        destination = job.get("destination")
+        dest_incremental = strat_kind == "full" and bool(destination)
+        dest_state = {}
+        if dest_incremental:
+            dest_state = load_dest_state(
+                resolve_dest_dir(destination, backup_root, job_id)
+            )
+        dest_state_files = len(dest_state)
+        if dest_state_files:
+            emit({
+                "event": "DEST_STATE_LOADED",
+                "job_id": job_id,
+                "files_total": dest_state_files,
+            })
+
+        if isinstance(strategy, dict):
             emit({
                 "event": "STRATEGY_SELECTED",
                 "job_id": job_id,
@@ -293,6 +350,7 @@ def run(args):
         selected = 0
         excluded = 0
         total_size = 0
+        files_skipped_unchanged = 0
 
         # Pack-strategy accumulators (untouched by other strategies).
         max_pack_bytes = options.get("max_pack_bytes", DEFAULT_MAX_PACK_BYTES)
@@ -341,17 +399,29 @@ def run(args):
 
             data = (source_dir / rel_path).read_bytes()
             size = len(data)
-            total_size += size
 
             if strat_kind == "full":
+                digest = content_digest(data)
+                # Incremental: skip a file whose backup already matches its hash.
+                if rel_path in dest_state and dest_state[rel_path] == digest:
+                    emit({
+                        "event": "FILE_SKIPPED_UNCHANGED",
+                        "job_id": job_id,
+                        "path": rel_path,
+                        "hash": digest,
+                    })
+                    files_skipped_unchanged += 1
+                    continue
+                total_size += size
                 emit({
                     "event": "FILE_BACKED_UP",
                     "job_id": job_id,
                     "path": rel_path,
                     "size": size,
-                    "checksum": content_digest(data),
+                    "checksum": digest,
                 })
             elif strat_kind == "verify":
+                total_size += size
                 emit({
                     "event": "FILE_VERIFIED",
                     "job_id": job_id,
@@ -360,6 +430,7 @@ def run(args):
                     "checksum": content_digest(data),
                 })
             elif strat_kind == "pack":
+                total_size += size
                 # Finalize the open pack before a file that would overflow it.
                 if pack_members and pack_size + size > max_pack_bytes:
                     finalize_pack()
@@ -391,6 +462,9 @@ def run(args):
             completed["total_size"] = total_size
         if strat_kind == "pack":
             completed["packs"] = packs_done
+        if dest_incremental:
+            completed["files_skipped_unchanged"] = files_skipped_unchanged
+            completed["dest_state_files"] = dest_state_files
         emit(completed)
 
 
@@ -417,6 +491,12 @@ def main(argv=None):
     )
     parser.add_argument(
         "--mount", required=True, help="Path treated as the 'mount://' root."
+    )
+    parser.add_argument(
+        "--backup",
+        default=None,
+        help="Path treated as the 'backup://' root (may not yet exist). "
+        "If omitted, assume no existing backups exist.",
     )
     args = parser.parse_args(argv)
     run(args)
