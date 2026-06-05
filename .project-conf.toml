@@ -20,3 +20,4 @@ branch_type          = "feat"
 metrics_emit_path    = "/Users/iansmith/slopbench/results/pipeline-metrics"
 on_parallel_agents   = "proceed"
 on_phase0_tests_pass = "continue"
+archive_immediately  = true
