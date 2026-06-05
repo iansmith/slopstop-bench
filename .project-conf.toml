@@ -12,7 +12,7 @@ in_progress = "status:in-progress"
 [pr_review]
 backend = "claude"
 effort  = "high"
-fix     = false
+fix     = true
 
 [autonomous]
 enabled              = true
