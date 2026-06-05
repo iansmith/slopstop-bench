@@ -313,9 +313,10 @@ def run(args):
         # A job opts into backup operations via an optional `strategy` block.
         # Without it, behavior is identical to checkpoint 1.
         strategy = job.get("strategy")
+        has_strategy = isinstance(strategy, dict)
         strat_kind = None
         options = {}
-        if isinstance(strategy, dict):
+        if has_strategy:
             strat_kind = strategy.get("kind")
             options = strategy.get("options") or {}
 
@@ -339,7 +340,7 @@ def run(args):
                 "files_total": dest_state_files,
             })
 
-        if isinstance(strategy, dict):
+        if has_strategy:
             emit({
                 "event": "STRATEGY_SELECTED",
                 "job_id": job_id,
