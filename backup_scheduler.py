@@ -219,6 +219,46 @@ def load_dest_state(dest_dir):
     return state
 
 
+def load_dest_packs(dest_dir):
+    """Map pack name -> loaded-pack info for existing pack-*.tar files, or {}.
+
+    Backs the pack strategy's incremental mode. Reads each `pack-N.tar` directly
+    under dest_dir (top level only), in numeric pack order, returning each pack's
+    member bytes, the SHA-256 of the raw tar file, the member count, and the
+    summed member size. Tolerates a missing directory.
+    """
+    packs = {}
+    if dest_dir is None or not dest_dir.exists():
+        return packs
+
+    def pack_index(path):
+        m = re.match(r"pack-(\d+)\.tar$", path.name)
+        return int(m.group(1)) if m else -1
+
+    pack_paths = sorted(
+        (p for p in dest_dir.glob("pack-*.tar") if p.is_file() and pack_index(p) >= 0),
+        key=pack_index,
+    )
+    for path in pack_paths:
+        raw = path.read_bytes()
+        members = {}
+        size = 0
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tar:
+            for info in tar.getmembers():
+                if not info.isfile():
+                    continue
+                content = tar.extractfile(info).read()
+                members[info.name] = content
+                size += len(content)
+        packs[path.name] = {
+            "members": members,
+            "checksum": content_digest(raw),
+            "files_total": len(members),
+            "size": size,
+        }
+    return packs
+
+
 def list_source_files(source_dir):
     """All files under source_dir, as source-relative POSIX paths, sorted."""
     if not source_dir.exists():
@@ -340,11 +380,37 @@ def run(args):
                 "files_total": dest_state_files,
             })
 
+        # Incremental pack backups: when a pack job points at a destination that
+        # already holds pack-*.tar archives, load them so unchanged files and
+        # unchanged packs can be detected. PACK_LOADED is emitted just below,
+        # after STRATEGY_SELECTED and before any file work.
+        pack_incremental = (
+            strat_kind == "pack" and backup_root is not None and bool(destination)
+        )
+        loaded_packs = {}
+        pack_member_hashes = {}
+        if pack_incremental:
+            loaded_packs = load_dest_packs(
+                resolve_dest_dir(destination, backup_root, job_id)
+            )
+            for info in loaded_packs.values():
+                for arcname, content in info["members"].items():
+                    pack_member_hashes[arcname] = content_digest(content)
+
         if has_strategy:
             emit({
                 "event": "STRATEGY_SELECTED",
                 "job_id": job_id,
                 "kind": strat_kind,
+            })
+
+        for name, info in loaded_packs.items():
+            emit({
+                "event": "PACK_LOADED",
+                "job_id": job_id,
+                "name": name,
+                "files_total": info["files_total"],
+                "checksum": info["checksum"],
             })
 
         source_dir = resolve_source_dir(job.get("source", MOUNT_PREFIX), mount)
@@ -362,16 +428,42 @@ def run(args):
 
         def finalize_pack():
             nonlocal pack_members, pack_size, packs_done
+            name = "pack-{}.tar".format(pack_index)
             tar_bytes = build_pack_tar(pack_members)
-            emit({
-                "event": "PACK_CREATED",
-                "job_id": job_id,
-                "name": "pack-{}.tar".format(pack_index),
-                "size": pack_size,
-                "timestamp": now_local_str,
-                "checksum": content_digest(tar_bytes),
-                "tar_size": len(tar_bytes),
-            })
+            checksum = content_digest(tar_bytes)
+            prior = loaded_packs.get(name)
+            if prior is None:
+                # No counterpart in the destination: a brand-new pack.
+                emit({
+                    "event": "PACK_CREATED",
+                    "job_id": job_id,
+                    "name": name,
+                    "size": pack_size,
+                    "timestamp": now_local_str,
+                    "checksum": checksum,
+                    "tar_size": len(tar_bytes),
+                })
+            elif checksum == prior["checksum"]:
+                # Rebuilt bytes match the stored pack exactly: nothing to do.
+                emit({
+                    "event": "PACK_UNCHANGED",
+                    "job_id": job_id,
+                    "name": name,
+                    "checksum": checksum,
+                })
+            else:
+                # Contents shifted: rewrite, carrying the prior size/checksum.
+                emit({
+                    "event": "PACK_UPDATED",
+                    "job_id": job_id,
+                    "name": name,
+                    "size": pack_size,
+                    "checksum": checksum,
+                    "timestamp": now_local_str,
+                    "tar_size": len(tar_bytes),
+                    "old_size": prior["size"],
+                    "old_checksum": prior["checksum"],
+                })
             packs_done += 1
             pack_members = []
             pack_size = 0
@@ -437,15 +529,29 @@ def run(args):
                     finalize_pack()
                 if not pack_members:
                     pack_index += 1
+                # The file joins the rebuilt pack regardless of change status; the
+                # event only distinguishes whether its bytes already match the
+                # copy carried in the loaded pack (incremental mode).
                 pack_members.append((rel_path, data))
                 pack_size += size
-                emit({
-                    "event": "FILE_PACKED",
-                    "job_id": job_id,
-                    "pack_id": pack_index,
-                    "path": rel_path,
-                    "size": size,
-                })
+                digest = content_digest(data)
+                if pack_incremental and pack_member_hashes.get(rel_path) == digest:
+                    emit({
+                        "event": "PACK_SKIP_UNCHANGED",
+                        "job_id": job_id,
+                        "pack_id": pack_index,
+                        "path": rel_path,
+                        "size": size,
+                        "hash": digest,
+                    })
+                else:
+                    emit({
+                        "event": "FILE_PACKED",
+                        "job_id": job_id,
+                        "pack_id": pack_index,
+                        "path": rel_path,
+                        "size": size,
+                    })
                 # A lone file that lands strictly over the cap closes its pack.
                 if pack_size > max_pack_bytes:
                     finalize_pack()
