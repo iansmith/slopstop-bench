@@ -224,8 +224,8 @@ def load_dest_packs(dest_dir):
 
     Backs the pack strategy's incremental mode. Reads each `pack-N.tar` directly
     under dest_dir (top level only), in numeric pack order, returning each pack's
-    member bytes, the SHA-256 of the raw tar file, the member count, and the
-    summed member size. Tolerates a missing directory.
+    per-member content hashes, the SHA-256 of the raw tar file, the member count,
+    and the summed member size. Tolerates a missing directory.
     """
     packs = {}
     if dest_dir is None or not dest_dir.exists():
@@ -241,19 +241,19 @@ def load_dest_packs(dest_dir):
     )
     for path in pack_paths:
         raw = path.read_bytes()
-        members = {}
+        member_hashes = {}
         size = 0
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tar:
             for info in tar.getmembers():
                 if not info.isfile():
                     continue
                 content = tar.extractfile(info).read()
-                members[info.name] = content
+                member_hashes[info.name] = content_digest(content)
                 size += len(content)
         packs[path.name] = {
-            "members": members,
+            "member_hashes": member_hashes,
             "checksum": content_digest(raw),
-            "files_total": len(members),
+            "files_total": len(member_hashes),
             "size": size,
         }
     return packs
@@ -384,9 +384,7 @@ def run(args):
         # already holds pack-*.tar archives, load them so unchanged files and
         # unchanged packs can be detected. PACK_LOADED is emitted just below,
         # after STRATEGY_SELECTED and before any file work.
-        pack_incremental = (
-            strat_kind == "pack" and backup_root is not None and bool(destination)
-        )
+        pack_incremental = strat_kind == "pack" and bool(destination)
         loaded_packs = {}
         pack_member_hashes = {}
         if pack_incremental:
@@ -394,8 +392,7 @@ def run(args):
                 resolve_dest_dir(destination, backup_root, job_id)
             )
             for info in loaded_packs.values():
-                for arcname, content in info["members"].items():
-                    pack_member_hashes[arcname] = content_digest(content)
+                pack_member_hashes.update(info["member_hashes"])
 
         if has_strategy:
             emit({
