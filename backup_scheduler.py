@@ -9,12 +9,17 @@ See the BENCH-1 ticket for the full specification.
 """
 
 import argparse
+import hashlib
+import io
 import json
 import re
 import sys
+import tarfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+DEFAULT_MAX_PACK_BYTES = 1048576
 
 MOUNT_PREFIX = "mount://"
 
@@ -194,6 +199,37 @@ def list_source_files(source_dir):
 
 
 # --------------------------------------------------------------------------- #
+# Backup strategies
+# --------------------------------------------------------------------------- #
+def content_digest(data):
+    """SHA-256 over the given bytes, tagged 'sha256:{hex}'."""
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def build_pack_tar(entries):
+    """Build a deterministic GNU tar archive from (arcname, content) entries.
+
+    Determinism requires fixed per-entry metadata, so each member is added via
+    a hand-built TarInfo (never tarfile.add, which would stat the real file):
+    mtime=0, mode=0o644, uid=0, gid=0, uname="", gname="". Returns the raw tar
+    bytes (padded to a full record on close).
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as tar:
+        for arcname, content in entries:
+            info = tarfile.TarInfo(name=arcname)
+            info.size = len(content)
+            info.mtime = 0
+            info.mode = 0o644
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def run(args):
@@ -239,9 +275,48 @@ def run(args):
             "exclude_count": len(exclude),
         })
 
+        # A job opts into backup operations via an optional `strategy` block.
+        # Without it, behavior is identical to checkpoint 1.
+        strategy = job.get("strategy")
+        strat_kind = None
+        options = {}
+        if isinstance(strategy, dict):
+            strat_kind = strategy.get("kind")
+            options = strategy.get("options") or {}
+            emit({
+                "event": "STRATEGY_SELECTED",
+                "job_id": job_id,
+                "kind": strat_kind,
+            })
+
         source_dir = resolve_source_dir(job.get("source", MOUNT_PREFIX), mount)
         selected = 0
         excluded = 0
+        total_size = 0
+
+        # Pack-strategy accumulators (untouched by other strategies).
+        max_pack_bytes = options.get("max_pack_bytes", DEFAULT_MAX_PACK_BYTES)
+        pack_members = []   # (rel_path, data) currently in the open pack
+        pack_size = 0       # content bytes in the open pack
+        pack_index = 0      # 1-based id of the open pack; names pack-{id}.tar
+        packs_done = 0
+
+        def finalize_pack():
+            nonlocal pack_members, pack_size, packs_done
+            tar_bytes = build_pack_tar(pack_members)
+            emit({
+                "event": "PACK_CREATED",
+                "job_id": job_id,
+                "name": "pack-{}.tar".format(pack_index),
+                "size": pack_size,
+                "timestamp": now_local_str,
+                "checksum": content_digest(tar_bytes),
+                "tar_size": len(tar_bytes),
+            })
+            packs_done += 1
+            pack_members = []
+            pack_size = 0
+
         for rel_path in list_source_files(source_dir):
             pattern = first_matching_pattern(rel_path, matchers)
             if pattern is not None:
@@ -252,20 +327,71 @@ def run(args):
                     "pattern": pattern,
                 })
                 excluded += 1
-            else:
+                continue
+
+            emit({
+                "event": "FILE_SELECTED",
+                "job_id": job_id,
+                "path": rel_path,
+            })
+            selected += 1
+
+            if strat_kind is None:
+                continue
+
+            data = (source_dir / rel_path).read_bytes()
+            size = len(data)
+            total_size += size
+
+            if strat_kind == "full":
                 emit({
-                    "event": "FILE_SELECTED",
+                    "event": "FILE_BACKED_UP",
                     "job_id": job_id,
                     "path": rel_path,
+                    "size": size,
+                    "checksum": content_digest(data),
                 })
-                selected += 1
+            elif strat_kind == "verify":
+                emit({
+                    "event": "FILE_VERIFIED",
+                    "job_id": job_id,
+                    "path": rel_path,
+                    "size": size,
+                    "checksum": content_digest(data),
+                })
+            elif strat_kind == "pack":
+                # Finalize the open pack before a file that would overflow it.
+                if pack_members and pack_size + size > max_pack_bytes:
+                    finalize_pack()
+                if not pack_members:
+                    pack_index += 1
+                pack_members.append((rel_path, data))
+                pack_size += size
+                emit({
+                    "event": "FILE_PACKED",
+                    "job_id": job_id,
+                    "pack_id": pack_index,
+                    "path": rel_path,
+                    "size": size,
+                })
+                # A lone file that lands strictly over the cap closes its pack.
+                if pack_size > max_pack_bytes:
+                    finalize_pack()
 
-        emit({
+        if strat_kind == "pack" and pack_members:
+            finalize_pack()
+
+        completed = {
             "event": "JOB_COMPLETED",
             "job_id": job_id,
             "selected": selected,
             "excluded": excluded,
-        })
+        }
+        if strat_kind is not None:
+            completed["total_size"] = total_size
+        if strat_kind == "pack":
+            completed["packs"] = packs_done
+        emit(completed)
 
 
 def yaml_load(path):
