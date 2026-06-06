@@ -4,8 +4,23 @@ prefix = "BENCH"
 
 [status_labels]
 in_progress = "status:in-progress"
+# 3-state workflow: no in_review label.
+# Add  in_review = "status:in-review"  here to upgrade to 4-state.
+
+# PR review backend — mirrors ticket-plugin config.
+# Using claude high-effort review to match the quality bar we're measuring against.
+[pr_review]
+backend = "claude"
+effort  = "high"
+fix     = true
 
 [autonomous]
-enabled     = true
-branch_type = "feat"
-metrics_emit_path = "/Users/iansmith/slopbench/results/pipeline-metrics"
+enabled              = true
+branch_type          = "feat"
+metrics_emit_path    = "/Users/iansmith/slopbench/results/pipeline-metrics"
+on_parallel_agents   = "proceed"
+on_phase0_tests_pass = "continue"
+archive_immediately  = true
+on_test_failure      = "benchmark-continue"  # continue but log override in pipeline.json for analysis
+cc_warn_threshold    = 10                    # functions with CC > 10 get called out in PR body (SCB erosion threshold)
+cc_reject_threshold  = 15                    # functions with CC > 15 hard-block the PR (lizard's own warning level)
