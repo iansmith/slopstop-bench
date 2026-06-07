@@ -244,6 +244,52 @@ def _load_dest_state(dest_dir) -> dict:
     return {rel: _sha256(_read_file(dest_dir, rel)) for rel in _list_files(dest_dir)}
 
 
+_PACK_NAME_RE = re.compile(r"^pack-(\d+)\.tar$")
+
+
+def _read_tar_members(raw: bytes) -> list:
+    """Enumerate a tar archive's regular-file members as ordered ``(name, content)`` pairs."""
+    members = []
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tar:
+        for info in tar.getmembers():
+            if not info.isfile():
+                continue
+            handle = tar.extractfile(info)
+            members.append((info.name, handle.read() if handle is not None else b""))
+    return members
+
+
+def _load_packs(dest_dir) -> list:
+    """Load existing ``pack-<N>.tar`` archives from a pack job's destination.
+
+    Returns an ascending-by-index list of pack records, each a dict with the pack
+    ``name``, its numeric ``index``, ordered ``(arcname, content)`` ``members``, the
+    ``content_size`` (sum of member byte lengths) and the ``checksum`` of the raw tar
+    bytes. A missing directory — or one holding no ``pack-<N>.tar`` files — yields
+    ``[]``, leaving the pack strategy in its non-incremental, checkpoint-2 mode. Only
+    files matching ``pack-<N>.tar`` are considered, so unrelated destination contents
+    are ignored.
+    """
+    if not dest_dir or not os.path.isdir(dest_dir):
+        return []
+    loaded = []
+    for name in os.listdir(dest_dir):
+        match = _PACK_NAME_RE.match(name)
+        if match is None:
+            continue
+        raw = _read_file(dest_dir, name)
+        members = _read_tar_members(raw)
+        loaded.append({
+            "name": name,
+            "index": int(match.group(1)),
+            "members": members,
+            "content_size": sum(len(content) for _, content in members),
+            "checksum": _sha256(raw),
+        })
+    loaded.sort(key=lambda pack: pack["index"])
+    return loaded
+
+
 def _pack_tar_bytes(members) -> bytes:
     """Serialize ``members`` (ordered ``(arcname, content)``) to deterministic GNU-tar bytes.
 
@@ -331,19 +377,41 @@ class _PerFileStrategy:
 
 
 class _PackStrategy:
-    """``pack``: group selected files into sequential, size-limited GNU-tar archives."""
+    """``pack``: group selected files into sequential, size-limited GNU-tar archives.
 
-    def __init__(self, emit, job_id: str, source_dir: str, now_local: str, max_pack_bytes: int):
+    When existing ``pack-<N>.tar`` archives are loaded from the destination the
+    strategy runs *incrementally*. The same packing algorithm reruns over the
+    current files (so ``max_pack_bytes`` still governs the layout), but a file whose
+    content matches its archived copy is reported as ``PACK_SKIP_UNCHANGED`` rather
+    than ``FILE_PACKED`` — though it is still placed into the rebuilt archive. Each
+    finalized pack is compared by name to the old archive of the same index:
+    byte-identical tar bytes emit ``PACK_UNCHANGED``; otherwise ``PACK_UPDATED``
+    (carrying the old pack's ``old_size`` and ``old_checksum``) — both in place of
+    ``PACK_CREATED``. With no loaded packs the behavior is exactly checkpoint 2.
+    """
+
+    def __init__(self, emit, job_id: str, source_dir: str, now_local: str,
+                 max_pack_bytes: int, loaded_packs: list):
         self._emit = emit
         self._job_id = job_id
         self._source_dir = source_dir
         self._now_local = now_local
         self._max_pack_bytes = max_pack_bytes
+        self._incremental = bool(loaded_packs)
+        # Union of every loaded pack's members: a current file is "unchanged" when
+        # its content hash matches the hash stored under the same arcname.
+        self._dest_state = {
+            arcname: _sha256(content)
+            for pack in loaded_packs
+            for arcname, content in pack["members"]
+        }
+        self._old_by_index = {pack["index"]: pack for pack in loaded_packs}
         self._pack_index = 0
         self._pending = []        # (rel, content) accumulated in the currently open pack
         self._pending_size = 0
         self._packs = 0
         self._total_size = 0
+        self._skipped = 0
 
     def handle(self, rel: str) -> None:
         content = _read_file(self._source_dir, rel)
@@ -357,47 +425,95 @@ class _PackStrategy:
         self._pending.append((rel, content))
         self._pending_size += size
         self._total_size += size
-        self._emit({
-            "event": "FILE_PACKED",
-            "job_id": self._job_id,
-            "pack_id": self._pack_index,
-            "path": rel,
-            "size": size,
-        })
+        checksum = _sha256(content)
+        if self._incremental and self._dest_state.get(rel) == checksum:
+            self._skipped += 1
+            self._emit({
+                "event": "PACK_SKIP_UNCHANGED",
+                "job_id": self._job_id,
+                "pack_id": self._pack_index,
+                "path": rel,
+                "size": size,
+                "hash": checksum,
+            })
+        else:
+            self._emit({
+                "event": "FILE_PACKED",
+                "job_id": self._job_id,
+                "pack_id": self._pack_index,
+                "path": rel,
+                "size": size,
+            })
 
     def _finalize_pack(self) -> None:
         tar = _pack_tar_bytes(self._pending)
-        self._emit({
-            "event": "PACK_CREATED",
-            "job_id": self._job_id,
-            "name": f"pack-{self._pack_index}.tar",
-            "size": self._pending_size,
-            "timestamp": self._now_local,
-            "checksum": _sha256(tar),
-            "tar_size": len(tar),
-        })
+        self._emit(self._finalize_event(tar))
         self._packs += 1
         self._pending = []
         self._pending_size = 0
+
+    def _finalize_event(self, tar: bytes) -> dict:
+        """The PACK_CREATED / PACK_UNCHANGED / PACK_UPDATED event for the open pack."""
+        name = f"pack-{self._pack_index}.tar"
+        checksum = _sha256(tar)
+        if not self._incremental:
+            return {
+                "event": "PACK_CREATED",
+                "job_id": self._job_id,
+                "name": name,
+                "size": self._pending_size,
+                "timestamp": self._now_local,
+                "checksum": checksum,
+                "tar_size": len(tar),
+            }
+        old = self._old_by_index.get(self._pack_index)
+        if old is not None and old["checksum"] == checksum:
+            return {
+                "event": "PACK_UNCHANGED",
+                "job_id": self._job_id,
+                "name": name,
+                "checksum": checksum,
+            }
+        # Rewritten pack. A pack index beyond the loaded set has no prior archive
+        # (an unspecified edge the spec never exercises); fall back to an empty
+        # baseline so the required old_* fields are still present.
+        return {
+            "event": "PACK_UPDATED",
+            "job_id": self._job_id,
+            "name": name,
+            "size": self._pending_size,
+            "checksum": checksum,
+            "timestamp": self._now_local,
+            "tar_size": len(tar),
+            "old_size": old["content_size"] if old is not None else 0,
+            "old_checksum": old["checksum"] if old is not None else _sha256(_pack_tar_bytes([])),
+        }
 
     def finalize(self) -> None:
         if self._pending:
             self._finalize_pack()
 
     def summary(self) -> dict:
-        return {"packs": self._packs, "total_size": self._total_size}
+        result = {"packs": self._packs, "total_size": self._total_size}
+        if self._incremental:
+            result["files_skipped_unchanged"] = self._skipped
+            result["dest_state_files"] = 0
+        return result
 
 
 _PER_FILE_EVENTS = {"full": "FILE_BACKED_UP", "verify": "FILE_VERIFIED"}
 
 
-def _build_strategy(job: dict, emit, job_id: str, source_dir: str, now_local: str, dest_state: dict):
+def _build_strategy(job: dict, emit, job_id: str, source_dir: str, now_local: str,
+                    dest_state: dict, backup_root):
     """Construct the job's strategy, emitting STRATEGY_SELECTED when one is declared.
 
     A job with no ``strategy`` block gets a no-op strategy so the checkpoint-1
     event stream is reproduced byte-for-byte. ``dest_state`` carries the job's
-    existing-backup hashes for per-file strategies; ``pack`` ignores it (its
-    archives are not tracked incrementally).
+    existing-backup hashes for per-file strategies. ``pack`` instead loads its own
+    existing ``pack-<N>.tar`` archives from the destination — emitting one
+    ``PACK_LOADED`` per pack right after ``STRATEGY_SELECTED`` — and runs
+    incrementally when any are found.
     """
     strategy = job.get("strategy")
     if not strategy:
@@ -407,7 +523,16 @@ def _build_strategy(job: dict, emit, job_id: str, source_dir: str, now_local: st
     emit({"event": "STRATEGY_SELECTED", "job_id": job_id, "kind": kind})
     if kind == "pack":
         max_pack_bytes = options.get("max_pack_bytes", DEFAULT_MAX_PACK_BYTES)
-        return _PackStrategy(emit, job_id, source_dir, now_local, max_pack_bytes)
+        loaded = _load_packs(_dest_dir(backup_root, job.get("destination"), job_id))
+        for pack in loaded:
+            emit({
+                "event": "PACK_LOADED",
+                "job_id": job_id,
+                "name": pack["name"],
+                "files_total": len(pack["members"]),
+                "checksum": pack["checksum"],
+            })
+        return _PackStrategy(emit, job_id, source_dir, now_local, max_pack_bytes, loaded)
     return _PerFileStrategy(emit, job_id, source_dir, _PER_FILE_EVENTS.get(kind, "FILE_BACKED_UP"), dest_state)
 
 
@@ -437,7 +562,7 @@ def _run_job(job: dict, mount: str, now_local: str, emit, backup_root) -> None:
 
     dest_state = _resolve_dest_state(job, job_id, backup_root, emit)
     source_dir = _source_dir(mount, job.get("source", MOUNT_PREFIX))
-    strategy = _build_strategy(job, emit, job_id, source_dir, now_local, dest_state)
+    strategy = _build_strategy(job, emit, job_id, source_dir, now_local, dest_state, backup_root)
 
     selected = excluded = 0
     for rel in _list_files(source_dir):
