@@ -155,9 +155,13 @@ def _recurring_due(when: dict, tz: ZoneInfo, w_start: datetime, w_end: datetime)
     step = timedelta(days=1)
     while day <= last:
         if weekdays is None or day.weekday() in weekdays:
-            trigger = datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz)
-            if w_start <= trigger <= w_end:
-                return True
+            # A DST fall-back makes the wall time ambiguous (two UTC instants);
+            # treat the job as due if either instant lands in the window so a
+            # scheduled backup is never silently skipped on the repeated hour.
+            for fold in (0, 1):
+                trigger = datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz, fold=fold)
+                if w_start <= trigger <= w_end:
+                    return True
         day += step
     return False
 
@@ -233,7 +237,12 @@ def main(argv=None) -> int:
 
     emit({"event": "SCHEDULE_PARSED", "timezone": tz_name, "jobs_total": len(jobs)})
 
-    due = [j for j in jobs if j.get("enabled", True) and _is_due(j["when"], tz, w_start, w_end)]
+    # Only an explicit `enabled: false` disables a job; a missing or null value
+    # falls back to the spec default (enabled).
+    due = [
+        j for j in jobs
+        if j.get("enabled", True) is not False and _is_due(j["when"], tz, w_start, w_end)
+    ]
     due.sort(key=lambda job: job["id"])
     for job in due:
         _run_job(job, args.mount, now_local, emit)
