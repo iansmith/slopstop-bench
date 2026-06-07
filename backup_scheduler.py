@@ -12,16 +12,20 @@ the deterministic stream of events.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 import os
 import re
 import sys
+import tarfile
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import yaml
 
 MOUNT_PREFIX = "mount://"
+DEFAULT_MAX_PACK_BYTES = 1048576
 
 # Python's date.weekday(): Monday == 0 ... Sunday == 6.
 WEEKDAYS = {
@@ -187,6 +191,168 @@ def _list_files(source_dir: str) -> list[str]:
     return found
 
 
+# --------------------------------------------------------------------------- #
+# Backup strategies
+# --------------------------------------------------------------------------- #
+def _read_file(source_dir: str, rel: str) -> bytes:
+    """Read a selected file whole.
+
+    Reading the entire file is acceptable here: this is a simulated single run
+    over a small tree and the deliverable is the event stream, not a streaming
+    copy.
+    """
+    with open(os.path.join(source_dir, rel), "rb") as handle:
+        return handle.read()
+
+
+def _sha256(content: bytes) -> str:
+    """SHA-256 of ``content`` as the spec's ``sha256:{hex}`` string."""
+    return "sha256:" + hashlib.sha256(content).hexdigest()
+
+
+def _pack_tar_bytes(members) -> bytes:
+    """Serialize ``members`` (ordered ``(arcname, content)``) to deterministic GNU-tar bytes.
+
+    Every entry's metadata is normalized so the archive — and therefore its
+    SHA-256 — depends only on the names, contents, and order. ``tarfile`` pads
+    the closed archive up to its 10240-byte record size; those padding bytes are
+    part of both the checksum and ``tar_size``.
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as tar:
+        for arcname, content in members:
+            info = tarfile.TarInfo(name=arcname)
+            info.size = len(content)
+            info.mtime = 0
+            info.mode = 0o644
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+class _NullStrategy:
+    """No strategy declared: emit nothing extra and leave JOB_COMPLETED unchanged."""
+
+    def handle(self, rel: str) -> None:
+        pass
+
+    def finalize(self) -> None:
+        pass
+
+    def summary(self) -> dict:
+        return {}
+
+
+class _PerFileStrategy:
+    """``full`` / ``verify``: emit one event per selected file with its size and checksum."""
+
+    def __init__(self, emit, job_id: str, source_dir: str, event_name: str):
+        self._emit = emit
+        self._job_id = job_id
+        self._source_dir = source_dir
+        self._event_name = event_name
+        self._total_size = 0
+
+    def handle(self, rel: str) -> None:
+        content = _read_file(self._source_dir, rel)
+        self._total_size += len(content)
+        self._emit({
+            "event": self._event_name,
+            "job_id": self._job_id,
+            "path": rel,
+            "size": len(content),
+            "checksum": _sha256(content),
+        })
+
+    def finalize(self) -> None:
+        pass
+
+    def summary(self) -> dict:
+        return {"total_size": self._total_size}
+
+
+class _PackStrategy:
+    """``pack``: group selected files into sequential, size-limited GNU-tar archives."""
+
+    def __init__(self, emit, job_id: str, source_dir: str, now_local: str, max_pack_bytes: int):
+        self._emit = emit
+        self._job_id = job_id
+        self._source_dir = source_dir
+        self._now_local = now_local
+        self._max_pack_bytes = max_pack_bytes
+        self._pack_index = 0
+        self._pending = []        # (rel, content) accumulated in the currently open pack
+        self._pending_size = 0
+        self._packs = 0
+        self._total_size = 0
+
+    def handle(self, rel: str) -> None:
+        content = _read_file(self._source_dir, rel)
+        size = len(content)
+        # A file is always packed; if it would overflow a non-empty open pack,
+        # finalize that pack first so the file starts a fresh one.
+        if self._pending and self._pending_size + size > self._max_pack_bytes:
+            self._finalize_pack()
+        if not self._pending:
+            self._pack_index += 1
+        self._pending.append((rel, content))
+        self._pending_size += size
+        self._total_size += size
+        self._emit({
+            "event": "FILE_PACKED",
+            "job_id": self._job_id,
+            "pack_id": self._pack_index,
+            "path": rel,
+            "size": size,
+        })
+
+    def _finalize_pack(self) -> None:
+        tar = _pack_tar_bytes(self._pending)
+        self._emit({
+            "event": "PACK_CREATED",
+            "job_id": self._job_id,
+            "name": f"pack-{self._pack_index}.tar",
+            "size": self._pending_size,
+            "timestamp": self._now_local,
+            "checksum": _sha256(tar),
+            "tar_size": len(tar),
+        })
+        self._packs += 1
+        self._pending = []
+        self._pending_size = 0
+
+    def finalize(self) -> None:
+        if self._pending:
+            self._finalize_pack()
+
+    def summary(self) -> dict:
+        return {"packs": self._packs, "total_size": self._total_size}
+
+
+_PER_FILE_EVENTS = {"full": "FILE_BACKED_UP", "verify": "FILE_VERIFIED"}
+
+
+def _build_strategy(job: dict, emit, job_id: str, source_dir: str, now_local: str):
+    """Construct the job's strategy, emitting STRATEGY_SELECTED when one is declared.
+
+    A job with no ``strategy`` block gets a no-op strategy so the checkpoint-1
+    event stream is reproduced byte-for-byte.
+    """
+    strategy = job.get("strategy")
+    if not strategy:
+        return _NullStrategy()
+    kind = strategy.get("kind")
+    options = strategy.get("options") or {}
+    emit({"event": "STRATEGY_SELECTED", "job_id": job_id, "kind": kind})
+    if kind == "pack":
+        max_pack_bytes = options.get("max_pack_bytes", DEFAULT_MAX_PACK_BYTES)
+        return _PackStrategy(emit, job_id, source_dir, now_local, max_pack_bytes)
+    return _PerFileStrategy(emit, job_id, source_dir, _PER_FILE_EVENTS.get(kind, "FILE_BACKED_UP"))
+
+
 def _run_job(job: dict, mount: str, now_local: str, emit) -> None:
     job_id = job["id"]
     emit({"event": "JOB_ELIGIBLE", "job_id": job_id, "kind": job["when"]["kind"], "now_local": now_local})
@@ -194,16 +360,24 @@ def _run_job(job: dict, mount: str, now_local: str, emit) -> None:
     compiled = [(p, _glob_to_regex(p)) for p in exclude]
     emit({"event": "JOB_STARTED", "job_id": job_id, "exclude_count": len(exclude)})
 
+    source_dir = _source_dir(mount, job.get("source", MOUNT_PREFIX))
+    strategy = _build_strategy(job, emit, job_id, source_dir, now_local)
+
     selected = excluded = 0
-    for rel in _list_files(_source_dir(mount, job.get("source", MOUNT_PREFIX))):
+    for rel in _list_files(source_dir):
         pattern = _first_match(rel, compiled)
-        if pattern is None:
-            emit({"event": "FILE_SELECTED", "job_id": job_id, "path": rel})
-            selected += 1
-        else:
+        if pattern is not None:
             emit({"event": "FILE_EXCLUDED", "job_id": job_id, "path": rel, "pattern": pattern})
             excluded += 1
-    emit({"event": "JOB_COMPLETED", "job_id": job_id, "selected": selected, "excluded": excluded})
+            continue
+        emit({"event": "FILE_SELECTED", "job_id": job_id, "path": rel})
+        selected += 1
+        strategy.handle(rel)
+    strategy.finalize()
+
+    completed = {"event": "JOB_COMPLETED", "job_id": job_id, "selected": selected, "excluded": excluded}
+    completed.update(strategy.summary())
+    emit(completed)
 
 
 # --------------------------------------------------------------------------- #
