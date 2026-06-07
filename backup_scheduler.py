@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import yaml
 
 MOUNT_PREFIX = "mount://"
+BACKUP_PREFIX = "backup://"
 DEFAULT_MAX_PACK_BYTES = 1048576
 
 # Python's date.weekday(): Monday == 0 ... Sunday == 6.
@@ -212,6 +213,37 @@ def _sha256(content: bytes) -> str:
     return "sha256:" + hashlib.sha256(content).hexdigest()
 
 
+# --------------------------------------------------------------------------- #
+# Destination state (incremental backups)
+# --------------------------------------------------------------------------- #
+def _dest_dir(backup_root, destination, job_id: str):
+    """Resolve a job's ``backup://`` destination to ``<backup_root>/<sub>/<job_id>``.
+
+    Mirrors ``_source_dir`` for the ``backup://`` scheme. Returns ``None`` when
+    there is no backup root (``--backup`` absent) or the job declares no
+    ``destination`` — either way the job has no existing-backup state to consult.
+    """
+    if not backup_root or not destination:
+        return None
+    sub = destination[len(BACKUP_PREFIX):] if destination.startswith(BACKUP_PREFIX) else destination
+    sub = sub.strip("/")
+    base = os.path.join(backup_root, sub) if sub else backup_root
+    return os.path.join(base, job_id)
+
+
+def _load_dest_state(dest_dir) -> dict:
+    """Scan an existing per-job backup directory into a ``{rel_path: sha256}`` map.
+
+    A missing directory — the first run, or no ``--backup`` — yields an empty
+    map. Every file under ``dest_dir`` is hashed with the same ``sha256:{hex}``
+    convention used for source files, so an unchanged file produces an identical
+    hash on both sides.
+    """
+    if not dest_dir or not os.path.isdir(dest_dir):
+        return {}
+    return {rel: _sha256(_read_file(dest_dir, rel)) for rel in _list_files(dest_dir)}
+
+
 def _pack_tar_bytes(members) -> bytes:
     """Serialize ``members`` (ordered ``(arcname, content)``) to deterministic GNU-tar bytes.
 
@@ -249,31 +281,54 @@ class _NullStrategy:
 
 
 class _PerFileStrategy:
-    """``full`` / ``verify``: emit one event per selected file with its size and checksum."""
+    """``full`` / ``verify``: one event per selected file, skipping unchanged backups.
 
-    def __init__(self, emit, job_id: str, source_dir: str, event_name: str):
+    When ``dest_state`` (a ``{rel: sha256}`` map of the job's existing backups)
+    contains a matching hash for a selected file, the file is reported as
+    ``FILE_SKIPPED_UNCHANGED`` and excluded from ``total_size``; otherwise it is
+    backed up / verified as before.
+    """
+
+    def __init__(self, emit, job_id: str, source_dir: str, event_name: str, dest_state: dict):
         self._emit = emit
         self._job_id = job_id
         self._source_dir = source_dir
         self._event_name = event_name
+        self._dest_state = dest_state
+        self._dest_state_files = len(dest_state)
         self._total_size = 0
+        self._skipped = 0
 
     def handle(self, rel: str) -> None:
         content = _read_file(self._source_dir, rel)
+        checksum = _sha256(content)
+        if self._dest_state.get(rel) == checksum:
+            self._skipped += 1
+            self._emit({
+                "event": "FILE_SKIPPED_UNCHANGED",
+                "job_id": self._job_id,
+                "path": rel,
+                "hash": checksum,
+            })
+            return
         self._total_size += len(content)
         self._emit({
             "event": self._event_name,
             "job_id": self._job_id,
             "path": rel,
             "size": len(content),
-            "checksum": _sha256(content),
+            "checksum": checksum,
         })
 
     def finalize(self) -> None:
         pass
 
     def summary(self) -> dict:
-        return {"total_size": self._total_size}
+        return {
+            "total_size": self._total_size,
+            "files_skipped_unchanged": self._skipped,
+            "dest_state_files": self._dest_state_files,
+        }
 
 
 class _PackStrategy:
@@ -337,11 +392,13 @@ class _PackStrategy:
 _PER_FILE_EVENTS = {"full": "FILE_BACKED_UP", "verify": "FILE_VERIFIED"}
 
 
-def _build_strategy(job: dict, emit, job_id: str, source_dir: str, now_local: str):
+def _build_strategy(job: dict, emit, job_id: str, source_dir: str, now_local: str, dest_state: dict):
     """Construct the job's strategy, emitting STRATEGY_SELECTED when one is declared.
 
     A job with no ``strategy`` block gets a no-op strategy so the checkpoint-1
-    event stream is reproduced byte-for-byte.
+    event stream is reproduced byte-for-byte. ``dest_state`` carries the job's
+    existing-backup hashes for per-file strategies; ``pack`` ignores it (its
+    archives are not tracked incrementally).
     """
     strategy = job.get("strategy")
     if not strategy:
@@ -352,18 +409,36 @@ def _build_strategy(job: dict, emit, job_id: str, source_dir: str, now_local: st
     if kind == "pack":
         max_pack_bytes = options.get("max_pack_bytes", DEFAULT_MAX_PACK_BYTES)
         return _PackStrategy(emit, job_id, source_dir, now_local, max_pack_bytes)
-    return _PerFileStrategy(emit, job_id, source_dir, _PER_FILE_EVENTS.get(kind, "FILE_BACKED_UP"))
+    return _PerFileStrategy(emit, job_id, source_dir, _PER_FILE_EVENTS.get(kind, "FILE_BACKED_UP"), dest_state)
 
 
-def _run_job(job: dict, mount: str, now_local: str, emit) -> None:
+def _resolve_dest_state(job: dict, job_id: str, backup_root, emit) -> dict:
+    """Load and announce a per-file job's existing-backup state.
+
+    Only ``full``/``verify`` jobs track destination state; ``pack`` and
+    strategy-less jobs always get an empty map (no scan). ``DEST_STATE_LOADED``
+    is emitted — after ``JOB_STARTED``, before ``STRATEGY_SELECTED`` — only when
+    existing backup files are actually found.
+    """
+    strategy = job.get("strategy") or {}
+    if strategy.get("kind") not in _PER_FILE_EVENTS:
+        return {}
+    state = _load_dest_state(_dest_dir(backup_root, job.get("destination"), job_id))
+    if state:
+        emit({"event": "DEST_STATE_LOADED", "job_id": job_id, "files_total": len(state)})
+    return state
+
+
+def _run_job(job: dict, mount: str, now_local: str, emit, backup_root) -> None:
     job_id = job["id"]
     emit({"event": "JOB_ELIGIBLE", "job_id": job_id, "kind": job["when"]["kind"], "now_local": now_local})
     exclude = job.get("exclude") or []
     compiled = [(p, _glob_to_regex(p)) for p in exclude]
     emit({"event": "JOB_STARTED", "job_id": job_id, "exclude_count": len(exclude)})
 
+    dest_state = _resolve_dest_state(job, job_id, backup_root, emit)
     source_dir = _source_dir(mount, job.get("source", MOUNT_PREFIX))
-    strategy = _build_strategy(job, emit, job_id, source_dir, now_local)
+    strategy = _build_strategy(job, emit, job_id, source_dir, now_local, dest_state)
 
     selected = excluded = 0
     for rel in _list_files(source_dir):
@@ -392,6 +467,9 @@ def _parse_args(argv):
     parser.add_argument("--duration", type=float, default=24.0,
                         help="Window length in hours (inclusive). Default 24.")
     parser.add_argument("--mount", required=True, help="Filesystem path treated as the mount:// root.")
+    parser.add_argument("--backup", default=None,
+                        help="Filesystem path treated as the backup:// root. "
+                             "If omitted, no existing backups are assumed.")
     return parser.parse_args(argv)
 
 
@@ -421,7 +499,7 @@ def main(argv=None) -> int:
     ]
     due.sort(key=lambda job: job["id"])
     for job in due:
-        _run_job(job, args.mount, now_local, emit)
+        _run_job(job, args.mount, now_local, emit, args.backup)
     return 0
 
 
