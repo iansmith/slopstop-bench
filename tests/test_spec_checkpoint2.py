@@ -167,6 +167,28 @@ def test_pack_single_file_over_limit_is_packed_alone(tmp_path):
     assert jc["total_size"] == 100
 
 
+def test_pack_tar_size_spans_multiple_records(tmp_path):
+    """A pack larger than one 10240-byte tar record reports the real padded tar_size.
+
+    Every other pack in this suite holds <100 content bytes, so its archive is
+    always exactly one 10240-byte GNU record — a constant ``tar_size`` would pass
+    them all. Only a file that overflows a record exercises the multi-record
+    padding the spec's deterministic-checksum rule depends on.
+    """
+    big = b"\xab" * 12000  # > 10240: archive spans more than one record
+    write_tree(tmp_path / "mount", {"big.dat": big})
+    events = events_of(
+        run_scheduler(tmp_path, strategy_schedule("pack", options={"max_pack_bytes": 100000}))
+    )
+    created = named(events, "PACK_CREATED")
+    assert len(created) == 1
+    expected_tar = canonical_tar_bytes([("big.dat", big)])
+    assert created[0]["tar_size"] == len(expected_tar)
+    assert created[0]["tar_size"] > 10240, "tar_size must be the real archive size, not a constant"
+    assert created[0]["checksum"] == sha256_prefixed(expected_tar)
+    assert created[0]["size"] == 12000
+
+
 def test_pack_default_max_pack_bytes_groups_small_files(tmp_path):
     """Boundary: with ``options`` omitted, the default 1 MiB limit packs small files together."""
     contents = {"a": b"x" * 10, "b": b"y" * 10, "c": b"z" * 10}

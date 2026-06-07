@@ -5,8 +5,10 @@ Parses a YAML schedule, decides which jobs are *due* within a time window,
 simulates running each due job by applying its glob ``exclude`` rules to the
 source file tree, and emits the resulting event history as JSON Lines on stdout.
 
-Backing up is only simulated: no files are read or copied. The deliverable is
-the deterministic stream of events.
+No backup is ever written or copied: the deliverable is the deterministic event
+stream. A job's ``strategy`` (``full``/``verify``/``pack``) does read each
+selected file to report its real size and SHA-256 — and, for ``pack``, to build
+the archive bytes — but nothing is persisted.
 """
 
 from __future__ import annotations
