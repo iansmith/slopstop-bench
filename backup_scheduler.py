@@ -295,7 +295,6 @@ class _PerFileStrategy:
         self._source_dir = source_dir
         self._event_name = event_name
         self._dest_state = dest_state
-        self._dest_state_files = len(dest_state)
         self._total_size = 0
         self._skipped = 0
 
@@ -327,7 +326,7 @@ class _PerFileStrategy:
         return {
             "total_size": self._total_size,
             "files_skipped_unchanged": self._skipped,
-            "dest_state_files": self._dest_state_files,
+            "dest_state_files": len(self._dest_state),
         }
 
 
