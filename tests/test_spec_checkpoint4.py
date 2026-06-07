@@ -294,6 +294,10 @@ def test_all_files_unchanged_skips_every_file_and_marks_packs_unchanged(tmp_path
     assert named(events, "PACK_UPDATED") == []
     assert named(events, "PACK_CREATED") == []
 
+    # Packs finalize lazily — pack-N closes when the file that overflows it arrives
+    # (or at end of stream), matching the existing checkpoint-2 finalization timing
+    # and the detailed "Some Files Changed" spec example. So PACK_UNCHANGED for
+    # pack-1 lands just after FILE_SELECTED C (which starts pack-2), etc.
     seq = [
         (e["event"], ident(e))
         for e in events
@@ -302,10 +306,8 @@ def test_all_files_unchanged_skips_every_file_and_marks_packs_unchanged(tmp_path
     assert seq == [
         ("FILE_SELECTED", "A"), ("PACK_SKIP_UNCHANGED", "A"),
         ("FILE_SELECTED", "B"), ("PACK_SKIP_UNCHANGED", "B"),
-        ("PACK_UNCHANGED", "pack-1.tar"),
-        ("FILE_SELECTED", "C"), ("PACK_SKIP_UNCHANGED", "C"),
-        ("PACK_UNCHANGED", "pack-2.tar"),
-        ("FILE_SELECTED", "D"), ("PACK_SKIP_UNCHANGED", "D"),
+        ("FILE_SELECTED", "C"), ("PACK_UNCHANGED", "pack-1.tar"), ("PACK_SKIP_UNCHANGED", "C"),
+        ("FILE_SELECTED", "D"), ("PACK_UNCHANGED", "pack-2.tar"), ("PACK_SKIP_UNCHANGED", "D"),
         ("FILE_SELECTED", "E"), ("PACK_SKIP_UNCHANGED", "E"),
         ("PACK_UNCHANGED", "pack-3.tar"),
     ]
